@@ -3,8 +3,6 @@
 #include <spdk/bdev.h>
 #include "spdk/bdev_module.h"
 
-#define max(a, b) (((a) > (b)) ? (a) : (b))
-
 /**
  * @brief Callback function for WAL bdev creation.
  *

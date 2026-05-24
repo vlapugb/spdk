@@ -819,6 +819,12 @@ static void wal_submit_request(struct spdk_io_channel *ch,
         }
         wio->owns_write_lock = true;
 
+        if (__atomic_load_n(&vb->rec_in_progress, __ATOMIC_ACQUIRE))
+        {
+            wal_complete(bdev_io, false);
+            return;
+        }
+
         wio->iovs = bdev_io->u.bdev.iovs;
         wio->iovcnt = bdev_io->u.bdev.iovcnt;
         wio->stage = WAL_STAGE_J_WRITE;
@@ -1315,6 +1321,13 @@ int wal_bdev_create_disk(char *main_bdev_name,
     }
     journal_bdev = spdk_bdev_desc_get_bdev(journal_desc);
 
+    if (main_bdev == journal_bdev)
+    {
+        SPDK_ERRLOG("WAL: main and journal resolve to the same bdev\n");
+        rc = -EINVAL;
+        goto err;
+    }
+
     if (spdk_bdev_get_block_size(main_bdev)
         != spdk_bdev_get_block_size(journal_bdev))
     {
@@ -1328,6 +1341,30 @@ int wal_bdev_create_disk(char *main_bdev_name,
     {
         SPDK_ERRLOG("WAL: journal bdev is too small\n");
         rc = -EINVAL;
+        goto err;
+    }
+
+    rc = spdk_bdev_module_claim_bdev_desc(main_desc,
+                                          SPDK_BDEV_CLAIM_READ_MANY_WRITE_ONE,
+                                          NULL,
+                                          &wal_bdev_if);
+    if (rc != 0)
+    {
+        SPDK_ERRLOG("WAL: failed to claim main bdev '%s': %d\n",
+                    main_bdev_name,
+                    rc);
+        goto err;
+    }
+
+    rc = spdk_bdev_module_claim_bdev_desc(journal_desc,
+                                          SPDK_BDEV_CLAIM_READ_MANY_WRITE_ONE,
+                                          NULL,
+                                          &wal_bdev_if);
+    if (rc != 0)
+    {
+        SPDK_ERRLOG("WAL: failed to claim journal bdev '%s': %d\n",
+                    journal_bdev_name,
+                    rc);
         goto err;
     }
 
@@ -1450,7 +1487,7 @@ int wal_bdev_delete_disk(char *name,
     {
         return -ENODEV;
     }
-    if (vb->rec_in_progress)
+    if (__atomic_load_n(&vb->rec_in_progress, __ATOMIC_ACQUIRE))
     {
         if (vb->rec.delete_pending)
         {
@@ -1462,7 +1499,7 @@ int wal_bdev_delete_disk(char *name,
         vb->rec.delete_arg = cb_arg;
         return 0;
     }
-    if (vb->write_in_progress)
+    if (__atomic_load_n(&vb->write_in_progress, __ATOMIC_ACQUIRE))
     {
         return -EBUSY;
     }
@@ -1481,6 +1518,11 @@ int wal_bdev_recover(const char *name,
         return -ENODEV;
     if (__atomic_test_and_set(&vb->rec_in_progress, __ATOMIC_ACQUIRE))
         return -EBUSY;
+    if (__atomic_load_n(&vb->write_in_progress, __ATOMIC_ACQUIRE))
+    {
+        __atomic_clear(&vb->rec_in_progress, __ATOMIC_RELEASE);
+        return -EBUSY;
+    }
 
     vb->rec_off_blocks = 0;
     vb->rec.done_cb = cb_fn;
@@ -1559,7 +1601,7 @@ static int wal_recover_poll(void *cb_arg)
 {
     struct wal_vbdev *vb = cb_arg;
 
-    if (!vb->rec_in_progress)
+    if (!__atomic_load_n(&vb->rec_in_progress, __ATOMIC_ACQUIRE))
     {
         return SPDK_POLLER_IDLE;
     }
@@ -1577,7 +1619,8 @@ static int wal_recover_poll(void *cb_arg)
 
     vb->rec.step_inflight = true;
     wal_recover_step(vb);
-    return vb->rec_in_progress ? SPDK_POLLER_BUSY : SPDK_POLLER_IDLE;
+    return __atomic_load_n(&vb->rec_in_progress, __ATOMIC_ACQUIRE) ?
+           SPDK_POLLER_BUSY : SPDK_POLLER_IDLE;
 }
 
 static void wal_recover_finish(struct wal_vbdev *vb, bool ok)
@@ -1870,9 +1913,9 @@ static void wal_recover_read_m_done(struct spdk_bdev_io *child_io,
                                            0);
     if (hdr->data_crc != data_crc)
     {
-        SPDK_ERRLOG("wal: data CRC mismatch during recovery at block %lu\n",
-                    vb->rec_off_blocks);
-        wal_recover_finish(vb, false);
+        SPDK_NOTICELOG("wal: recovery stopped at corrupt record payload at block %lu\n",
+                       vb->rec_off_blocks);
+        wal_recover_finish(vb, true);
         return;
     }
 
