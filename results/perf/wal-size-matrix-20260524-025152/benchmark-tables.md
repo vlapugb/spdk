@@ -1,15 +1,4 @@
-# WAL size matrix benchmark
 
-- Дата запуска: 2026-05-24T03:21:12
-- SPDK commit: `8289ba56c45fe278af9b3765a95068dba5af4d17`
-- Workload: write, 4 KiB, qd1
-- Runtime на комбинацию: 5 s
-- Backing device: malloc bdev
-- Обычный bdev: прямой write в `MallocMain`, без WAL и journal bdev.
-- SPDK runtime: `--no-pci --no-huge --iova-mode=va`
-- Размер журнала округлён до ближайшего 4 KiB block.
-- `IOPS bdev` и `throughput bdev` измерены отдельным запуском обычного bdev для того же main size.
-- Ratio-колонки показывают отношение WAL-строки к обычному bdev того же main size.
 
 ## bdevperf
 

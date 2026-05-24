@@ -52,6 +52,8 @@ struct wal_vbdev
 
     bool rec_in_progress;
     bool write_in_progress;
+    bool recovery_required;
+    bool registered;
     uint64_t rec_off_blocks;
     uint32_t rec_chunk_blocks;
 
@@ -73,6 +75,7 @@ struct wal_vbdev
         bool delete_pending;
         bool step_inflight;
         bool stop;
+        bool replayed_record;
         uint64_t scanned_blocks;
     } rec;
 
@@ -297,6 +300,26 @@ static void wal_bdev_io_cleanup(struct spdk_bdev_io *orig)
     }
 }
 
+static bool wal_recovery_required(struct wal_vbdev *vb)
+{
+    return __atomic_load_n(&vb->recovery_required, __ATOMIC_ACQUIRE);
+}
+
+static void wal_set_recovery_required(struct wal_vbdev *vb)
+{
+    __atomic_store_n(&vb->recovery_required, true, __ATOMIC_RELEASE);
+}
+
+static void wal_clear_recovery_required(struct wal_vbdev *vb)
+{
+    __atomic_store_n(&vb->recovery_required, false, __ATOMIC_RELEASE);
+}
+
+static bool wal_recovery_required_unrepaired(struct wal_vbdev *vb)
+{
+    return wal_recovery_required(vb) && !vb->rec.replayed_record;
+}
+
 static void wal_recover_step(struct wal_vbdev *vb);
 static int wal_recover_poll(void *cb_arg);
 
@@ -459,6 +482,7 @@ static void wal_main_flush_done(struct spdk_bdev_io *child_io,
 
     if (!success)
     {
+        wal_set_recovery_required(vb);
         wal_complete(orig, false);
         return;
     }
@@ -521,6 +545,7 @@ static void wal_main_write_done(struct spdk_bdev_io *child_io,
     spdk_bdev_free_io(child_io);
     if (!success)
     {
+        wal_set_recovery_required(vb);
         wal_complete(orig, false);
         return;
     }
@@ -534,6 +559,7 @@ static void wal_main_write_done(struct spdk_bdev_io *child_io,
                                 orig);
     if (rc != 0)
     {
+        wal_set_recovery_required(vb);
         wal_complete(orig, false);
     }
 }
@@ -768,6 +794,12 @@ static void wal_submit_request(struct spdk_io_channel *ch,
     wio->offset_blocks = bdev_io->u.bdev.offset_blocks;
     wio->num_blocks = bdev_io->u.bdev.num_blocks;
 
+    if (wal_recovery_required(vb))
+    {
+        spdk_bdev_io_complete(bdev_io, SPDK_BDEV_IO_STATUS_FAILED);
+        return;
+    }
+
     switch (bdev_io->type)
     {
     case SPDK_BDEV_IO_TYPE_READ:
@@ -777,7 +809,8 @@ static void wal_submit_request(struct spdk_io_channel *ch,
         int rc;
 
         if (__atomic_load_n(&vb->rec_in_progress, __ATOMIC_ACQUIRE) ||
-            __atomic_load_n(&vb->write_in_progress, __ATOMIC_ACQUIRE))
+            __atomic_load_n(&vb->write_in_progress, __ATOMIC_ACQUIRE) ||
+            wal_recovery_required(vb))
         {
             spdk_bdev_io_complete(bdev_io, SPDK_BDEV_IO_STATUS_FAILED);
             return;
@@ -819,7 +852,8 @@ static void wal_submit_request(struct spdk_io_channel *ch,
         }
         wio->owns_write_lock = true;
 
-        if (__atomic_load_n(&vb->rec_in_progress, __ATOMIC_ACQUIRE))
+        if (__atomic_load_n(&vb->rec_in_progress, __ATOMIC_ACQUIRE) ||
+            wal_recovery_required(vb))
         {
             wal_complete(bdev_io, false);
             return;
@@ -986,7 +1020,8 @@ static void wal_submit_request(struct spdk_io_channel *ch,
         int rc;
 
         if (__atomic_load_n(&vb->rec_in_progress, __ATOMIC_ACQUIRE) ||
-            __atomic_load_n(&vb->write_in_progress, __ATOMIC_ACQUIRE))
+            __atomic_load_n(&vb->write_in_progress, __ATOMIC_ACQUIRE) ||
+            wal_recovery_required(vb))
         {
             spdk_bdev_io_complete(bdev_io, SPDK_BDEV_IO_STATUS_FAILED);
             return;
@@ -1011,7 +1046,8 @@ static void wal_submit_request(struct spdk_io_channel *ch,
         int rc;
 
         if (__atomic_load_n(&vb->rec_in_progress, __ATOMIC_ACQUIRE) ||
-            __atomic_load_n(&vb->write_in_progress, __ATOMIC_ACQUIRE))
+            __atomic_load_n(&vb->write_in_progress, __ATOMIC_ACQUIRE) ||
+            wal_recovery_required(vb))
         {
             spdk_bdev_io_complete(bdev_io, SPDK_BDEV_IO_STATUS_FAILED);
             return;
@@ -1068,16 +1104,6 @@ static int wal_destruct(void *ctx)
 
     spdk_io_device_unregister(vb, NULL);
 
-    if (vb->main_desc)
-    {
-        spdk_bdev_close(vb->main_desc);
-        vb->main_desc = NULL;
-    }
-    if (vb->journal_desc)
-    {
-        spdk_bdev_close(vb->journal_desc);
-        vb->journal_desc = NULL;
-    }
     if (vb->rec.poller)
     {
         spdk_poller_unregister(&vb->rec.poller);
@@ -1102,6 +1128,16 @@ static int wal_destruct(void *ctx)
     {
         spdk_dma_free(vb->rec.buf_m);
         vb->rec.buf_m = NULL;
+    }
+    if (vb->main_desc)
+    {
+        spdk_bdev_close(vb->main_desc);
+        vb->main_desc = NULL;
+    }
+    if (vb->journal_desc)
+    {
+        spdk_bdev_close(vb->journal_desc);
+        vb->journal_desc = NULL;
     }
 
     free(vb->bdev.name);
@@ -1191,6 +1227,10 @@ static void wal_init_complete(struct wal_init_ctx *ctx, int rc)
         if (rc != 0)
         {
             SPDK_ERRLOG("wal: spdk_bdev_register failed: %d\n", rc);
+        }
+        else
+        {
+            vb->registered = true;
         }
     }
 
@@ -1334,6 +1374,13 @@ int wal_bdev_create_disk(char *main_bdev_name,
         SPDK_ERRLOG("WAL: block sizes mismatch: %u vs %u\n",
                     spdk_bdev_get_block_size(main_bdev),
                     spdk_bdev_get_block_size(journal_bdev));
+        rc = -EINVAL;
+        goto err;
+    }
+    if (spdk_bdev_get_block_size(main_bdev) < sizeof(struct wal_superblock) ||
+        spdk_bdev_get_block_size(main_bdev) < sizeof(struct wal_record_header))
+    {
+        SPDK_ERRLOG("WAL: block size is too small for WAL metadata\n");
         rc = -EINVAL;
         goto err;
     }
@@ -1487,6 +1534,10 @@ int wal_bdev_delete_disk(char *name,
     {
         return -ENODEV;
     }
+    if (!vb->registered)
+    {
+        return -EBUSY;
+    }
     if (__atomic_load_n(&vb->rec_in_progress, __ATOMIC_ACQUIRE))
     {
         if (vb->rec.delete_pending)
@@ -1516,6 +1567,8 @@ int wal_bdev_recover(const char *name,
     struct wal_vbdev *vb = wal_find_by_name(name);
     if (!vb)
         return -ENODEV;
+    if (!vb->registered)
+        return -EBUSY;
     if (__atomic_test_and_set(&vb->rec_in_progress, __ATOMIC_ACQUIRE))
         return -EBUSY;
     if (__atomic_load_n(&vb->write_in_progress, __ATOMIC_ACQUIRE))
@@ -1531,6 +1584,7 @@ int wal_bdev_recover(const char *name,
     vb->rec.step_inflight = false;
     vb->rec.last_step = 0;
     vb->rec.scanned_blocks = 0;
+    vb->rec.replayed_record = false;
     vb->rec.delete_cb = NULL;
     vb->rec.delete_arg = NULL;
     vb->rec.delete_pending = false;
@@ -1727,6 +1781,14 @@ static void wal_recover_complete(struct wal_vbdev *vb, bool ok)
 
     vb->rec.step_inflight = false;
     vb->rec.stop = false;
+    if (ok)
+    {
+        wal_clear_recovery_required(vb);
+    }
+    else
+    {
+        wal_set_recovery_required(vb);
+    }
     __atomic_clear(&vb->rec_in_progress, __ATOMIC_RELEASE);
     vb->rec.done_cb = NULL;
     vb->rec.done_arg = NULL;
@@ -1817,7 +1879,7 @@ static void wal_recover_read_j_done(struct spdk_bdev_io *child_io,
     {
         SPDK_NOTICELOG("wal: recovery reached end of log at block %lu\n",
                        vb->rec_off_blocks);
-        wal_recover_finish(vb, true);
+        wal_recover_finish(vb, !wal_recovery_required_unrepaired(vb));
         return;
     }
 
@@ -1827,7 +1889,7 @@ static void wal_recover_read_j_done(struct spdk_bdev_io *child_io,
                        "%lu). Stopping.\n",
                        hdr->seq,
                        vb->sb.checkpoint_seq);
-        wal_recover_finish(vb, true);
+        wal_recover_finish(vb, !wal_recovery_required_unrepaired(vb));
         return;
     }
 
@@ -1915,7 +1977,7 @@ static void wal_recover_read_m_done(struct spdk_bdev_io *child_io,
     {
         SPDK_NOTICELOG("wal: recovery stopped at corrupt record payload at block %lu\n",
                        vb->rec_off_blocks);
-        wal_recover_finish(vb, true);
+        wal_recover_finish(vb, !wal_recovery_required_unrepaired(vb));
         return;
     }
 
@@ -1944,6 +2006,7 @@ static void wal_recover_write_done(struct spdk_bdev_io *child_io,
 
     if (!success)
     {
+        wal_set_recovery_required(vb);
         wal_recover_finish(vb, false);
         return;
     }
@@ -1956,6 +2019,7 @@ static void wal_recover_write_done(struct spdk_bdev_io *child_io,
                                 vb);
     if (rc != 0)
     {
+        wal_set_recovery_required(vb);
         wal_recover_finish(vb, false);
     }
 }
@@ -1971,12 +2035,14 @@ static void wal_recover_flush_done(struct spdk_bdev_io *child_io,
 
     if (!success)
     {
+        wal_set_recovery_required(vb);
         wal_recover_finish(vb, false);
         return;
     }
 
     vb->rec_off_blocks += (1 + hdr->num_blocks);
     vb->rec.scanned_blocks += (1 + hdr->num_blocks);
+    vb->rec.replayed_record = true;
     if (vb->rec_off_blocks >= vb->sb.journal_size)
     {
         vb->rec_off_blocks = 1;

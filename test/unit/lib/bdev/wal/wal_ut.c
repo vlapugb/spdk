@@ -17,7 +17,15 @@ int g_write_blocks_rc = 0;
 int g_writev_blocks_rc = 0;
 int g_read_blocks_rc = 0;
 int g_flush_blocks_rc = 0;
+uint32_t g_block_size = 512;
 bool g_fail_journal_sb_write = false;
+bool g_fail_main_writev = false;
+int g_claim_bdev_desc_rc = 0;
+uint32_t g_claim_bdev_desc_count = 0;
+bool g_same_underlying_bdev = false;
+bool g_close_with_rec_channel = false;
+struct wal_vbdev *g_destruct_vb = NULL;
+uint32_t g_unregister_count = 0;
 
 uint64_t g_last_write_lba = 0;
 uint32_t g_last_write_blocks = 0;
@@ -46,6 +54,9 @@ spdk_bdev_open_ext(const char *bdev_name, bool write, spdk_bdev_event_cb_t event
 }
 
 static int g_dummy_io_device = 0;
+static struct spdk_bdev g_main_bdev;
+static struct spdk_bdev g_journal_bdev;
+static struct spdk_bdev g_other_bdev;
 
 static int
 dummy_io_channel_create_cb(void *io_device, void *ctx_buf)
@@ -61,7 +72,14 @@ dummy_io_channel_destroy_cb(void *io_device, void *ctx_buf)
 struct spdk_bdev *
 spdk_bdev_desc_get_bdev(struct spdk_bdev_desc *desc)
 {
-    return (struct spdk_bdev *)0x87654321;
+    if (desc == (struct spdk_bdev_desc *)0x11111111) {
+        return &g_main_bdev;
+    }
+    if (desc == (struct spdk_bdev_desc *)0x22222222) {
+        return g_same_underlying_bdev ? &g_main_bdev : &g_journal_bdev;
+    }
+
+    return &g_other_bdev;
 }
 
 struct spdk_io_channel *
@@ -72,16 +90,53 @@ spdk_bdev_get_io_channel(struct spdk_bdev_desc *desc)
 
 DEFINE_STUB_V(spdk_bdev_module_examine_done, (struct spdk_bdev_module *module));
 DEFINE_STUB(spdk_bdev_reset, int, (struct spdk_bdev_desc *desc, struct spdk_io_channel *ch, spdk_bdev_io_completion_cb cb, void *cb_arg), 0);
-DEFINE_STUB(spdk_bdev_get_block_size, uint32_t, (const struct spdk_bdev *bdev), 512);
 DEFINE_STUB(spdk_bdev_get_num_blocks, uint64_t, (const struct spdk_bdev *bdev), 1024);
 DEFINE_STUB(spdk_bdev_get_buf_align, size_t, (const struct spdk_bdev *bdev), 64);
 DEFINE_STUB(spdk_bdev_get_name, const char *, (const struct spdk_bdev *bdev), "test_bdev");
 DEFINE_STUB(spdk_bdev_io_type_supported, bool, (struct spdk_bdev *bdev, enum spdk_bdev_io_type io_type), true);
-DEFINE_STUB_V(spdk_bdev_close, (struct spdk_bdev_desc *desc));
 DEFINE_STUB(spdk_bdev_register, int, (struct spdk_bdev *vbdev), 0);
-DEFINE_STUB_V(spdk_bdev_unregister, (struct spdk_bdev *bdev, spdk_bdev_unregister_cb cb_fn, void *cb_arg));
 DEFINE_STUB_V(spdk_bdev_free_io, (struct spdk_bdev_io *g_bdev_io));
 DEFINE_STUB_V(spdk_bdev_module_list_add, (struct spdk_bdev_module *bdev_module));
+
+void
+spdk_bdev_unregister(struct spdk_bdev *bdev, spdk_bdev_unregister_cb cb_fn, void *cb_arg)
+{
+    g_unregister_count++;
+    if (cb_fn) {
+        cb_fn(cb_arg, 0);
+    }
+}
+
+uint32_t
+spdk_bdev_get_block_size(const struct spdk_bdev *bdev)
+{
+    return g_block_size;
+}
+
+void
+spdk_bdev_close(struct spdk_bdev_desc *desc)
+{
+    if (g_destruct_vb &&
+        (desc == g_destruct_vb->main_desc || desc == g_destruct_vb->journal_desc) &&
+        (g_destruct_vb->rec.jch || g_destruct_vb->rec.mch)) {
+        g_close_with_rec_channel = true;
+    }
+}
+
+int
+spdk_bdev_module_claim_bdev_desc(struct spdk_bdev_desc *desc,
+                                 enum spdk_bdev_claim_type type,
+                                 struct spdk_bdev_claim_opts *opts,
+                                 struct spdk_bdev_module *module)
+{
+    CU_ASSERT_PTR_NOT_NULL(desc);
+    CU_ASSERT_EQUAL(type, SPDK_BDEV_CLAIM_READ_MANY_WRITE_ONE);
+    CU_ASSERT_PTR_NULL(opts);
+    CU_ASSERT_PTR_EQUAL(module, &wal_bdev_if);
+
+    g_claim_bdev_desc_count++;
+    return g_claim_bdev_desc_rc;
+}
 
 void
 spdk_bdev_io_complete(struct spdk_bdev_io *bdev_io, enum spdk_bdev_io_status status)
@@ -156,8 +211,15 @@ spdk_bdev_writev_blocks(struct spdk_bdev_desc *desc, struct spdk_io_channel *ch,
                         uint64_t offset_blocks, uint64_t num_blocks,
                         spdk_bdev_io_completion_cb cb, void *cb_arg)
 {
+    struct wal_vbdev *vb = TAILQ_FIRST(&g_wal);
+
     if (g_writev_blocks_rc != 0) {
         return g_writev_blocks_rc;
+    }
+
+    if (vb && desc == vb->main_desc && g_fail_main_writev) {
+        ut_wal_io_cpl(cb, false, cb_arg);
+        return 0;
     }
 
     if (desc == (struct spdk_bdev_desc *)0x22222222) {
@@ -262,7 +324,15 @@ test_setup(void)
     g_writev_blocks_rc = 0;
     g_read_blocks_rc = 0;
     g_flush_blocks_rc = 0;
+    g_block_size = 512;
     g_fail_journal_sb_write = false;
+    g_fail_main_writev = false;
+    g_claim_bdev_desc_rc = 0;
+    g_claim_bdev_desc_count = 0;
+    g_same_underlying_bdev = false;
+    g_close_with_rec_channel = false;
+    g_destruct_vb = NULL;
+    g_unregister_count = 0;
 
     allocate_threads(1);
     set_thread(0);
@@ -356,6 +426,56 @@ test_wal_init(void)
     CU_ASSERT(g_async_done == true);
     CU_ASSERT(g_async_rc == 0);
     CU_ASSERT(block_sz == 512);
+    CU_ASSERT_EQUAL(g_claim_bdev_desc_count, 2);
+
+    test_cleanup();
+}
+
+static void
+test_wal_init_rejects_claim_failure(void)
+{
+    int rc;
+
+    test_setup();
+    g_claim_bdev_desc_rc = -EBUSY;
+
+    rc = wal_bdev_create_disk("main", "journal", "wal0", NULL, NULL, test_cb, NULL);
+    CU_ASSERT_EQUAL(rc, -EBUSY);
+    CU_ASSERT_EQUAL(g_claim_bdev_desc_count, 1);
+    CU_ASSERT(TAILQ_EMPTY(&g_wal));
+
+    test_cleanup();
+}
+
+static void
+test_wal_init_rejects_same_underlying_bdev(void)
+{
+    int rc;
+
+    test_setup();
+    g_same_underlying_bdev = true;
+
+    rc = wal_bdev_create_disk("main", "journal", "wal0", NULL, NULL, test_cb, NULL);
+    CU_ASSERT_EQUAL(rc, -EINVAL);
+    CU_ASSERT_EQUAL(g_claim_bdev_desc_count, 0);
+    CU_ASSERT(TAILQ_EMPTY(&g_wal));
+
+    test_cleanup();
+}
+
+static void
+test_wal_init_rejects_small_block_size(void)
+{
+    int rc;
+
+    test_setup();
+    g_block_size = sizeof(struct wal_superblock) - 1;
+
+    rc = wal_bdev_create_disk("main", "journal", "wal0", NULL, NULL, test_cb, NULL);
+    CU_ASSERT_EQUAL(rc, -EINVAL);
+    CU_ASSERT(g_async_done == false);
+    CU_ASSERT_EQUAL(g_claim_bdev_desc_count, 0);
+    CU_ASSERT(TAILQ_EMPTY(&g_wal));
 
     test_cleanup();
 }
@@ -377,6 +497,38 @@ test_wal_init_rejects_corrupt_superblock(void)
     CU_ASSERT(g_async_done == true);
     CU_ASSERT_EQUAL(g_async_rc, -EIO);
     CU_ASSERT(TAILQ_EMPTY(&g_wal));
+
+    test_cleanup();
+}
+
+static void
+test_wal_delete_and_recover_reject_create_in_progress(void)
+{
+    struct wal_vbdev *vb;
+    int rc;
+
+    test_setup();
+
+    rc = wal_bdev_create_disk("main", "journal", "wal0", NULL, NULL, test_cb, NULL);
+    CU_ASSERT_EQUAL(rc, 0);
+    CU_ASSERT(g_async_done == false);
+
+    vb = TAILQ_FIRST(&g_wal);
+    CU_ASSERT_PTR_NOT_NULL_FATAL(vb);
+    CU_ASSERT(vb->registered == false);
+
+    rc = wal_bdev_delete_disk("wal0", test_cb, NULL);
+    CU_ASSERT_EQUAL(rc, -EBUSY);
+    CU_ASSERT_EQUAL(g_unregister_count, 0);
+
+    rc = wal_bdev_recover("wal0", test_cb, NULL);
+    CU_ASSERT_EQUAL(rc, -EBUSY);
+    CU_ASSERT(__atomic_load_n(&vb->rec_in_progress, __ATOMIC_ACQUIRE) == false);
+
+    poll_threads();
+    CU_ASSERT(g_async_done == true);
+    CU_ASSERT_EQUAL(g_async_rc, 0);
+    CU_ASSERT(vb->registered == true);
 
     test_cleanup();
 }
@@ -623,6 +775,69 @@ test_wal_checkpoint_not_advanced_on_sb_failure(void)
 }
 
 static void
+test_wal_main_failure_requires_recovery_before_new_io(void)
+{
+    struct wal_vbdev *vb;
+    struct spdk_io_channel *qch;
+    struct spdk_bdev_io *bdev_io;
+    struct iovec iov;
+    char data[512] = "replay after main failure";
+    int rc;
+
+    test_setup();
+    wal_bdev_create_disk("main", "journal", "wal0", NULL, NULL, test_cb, NULL);
+    poll_threads();
+    vb = TAILQ_FIRST(&g_wal);
+    CU_ASSERT_PTR_NOT_NULL_FATAL(vb);
+    qch = wal_get_io_channel(vb);
+
+    iov.iov_base = data;
+    iov.iov_len = sizeof(data);
+    g_fail_main_writev = true;
+    bdev_io = ut_alloc_wal_io(vb, SPDK_BDEV_IO_TYPE_WRITE, &iov, 1, 10, 1);
+    wal_submit_request(qch, bdev_io);
+    for (int i = 0; i < 8; i++) {
+        poll_threads();
+    }
+
+    CU_ASSERT_EQUAL(g_last_io_status, SPDK_BDEV_IO_STATUS_FAILED);
+    CU_ASSERT(wal_recovery_required(vb) == true);
+    CU_ASSERT_EQUAL(vb->sb.write_pos, 3);
+    CU_ASSERT_EQUAL(vb->sb.head_pos, 1);
+    CU_ASSERT_EQUAL(vb->sb.checkpoint_seq, 0);
+    free(bdev_io);
+
+    g_fail_main_writev = false;
+    g_io_complete_count = 0;
+    bdev_io = ut_alloc_wal_io(vb, SPDK_BDEV_IO_TYPE_WRITE, &iov, 1, 20, 1);
+    wal_submit_request(qch, bdev_io);
+    CU_ASSERT_EQUAL(g_last_io_status, SPDK_BDEV_IO_STATUS_FAILED);
+    CU_ASSERT_EQUAL(g_io_complete_count, 1);
+    CU_ASSERT_EQUAL(vb->sb.checkpoint_seq, 0);
+    free(bdev_io);
+
+    g_async_done = false;
+    rc = wal_bdev_recover("wal0", test_cb, NULL);
+    CU_ASSERT_EQUAL(rc, 0);
+    for (int i = 0; i < 20; i++) {
+        wal_recover_poll(vb);
+        poll_threads();
+        if (g_async_done) {
+            break;
+        }
+    }
+
+    CU_ASSERT(g_async_done == true);
+    CU_ASSERT_EQUAL(g_async_rc, 0);
+    CU_ASSERT(wal_recovery_required(vb) == false);
+    CU_ASSERT_EQUAL(g_last_write_lba, 10);
+    CU_ASSERT(memcmp(g_main_captured_data, data, sizeof(data)) == 0);
+
+    spdk_put_io_channel(qch);
+    test_cleanup();
+}
+
+static void
 test_wal_flush_rejected_during_recovery(void)
 {
     struct wal_vbdev *vb;
@@ -647,6 +862,29 @@ test_wal_flush_rejected_during_recovery(void)
     __atomic_store_n(&vb->rec_in_progress, false, __ATOMIC_RELEASE);
     free(bdev_io);
     spdk_put_io_channel(qch);
+    test_cleanup();
+}
+
+static void
+test_wal_recovery_rejects_during_write(void)
+{
+    struct wal_vbdev *vb;
+    int rc;
+
+    test_setup();
+    wal_bdev_create_disk("main", "journal", "wal0", NULL, NULL, test_cb, NULL);
+    poll_threads();
+    vb = TAILQ_FIRST(&g_wal);
+    CU_ASSERT_PTR_NOT_NULL_FATAL(vb);
+
+    g_async_done = false;
+    __atomic_store_n(&vb->write_in_progress, true, __ATOMIC_RELEASE);
+    rc = wal_bdev_recover("wal0", test_cb, NULL);
+    CU_ASSERT_EQUAL(rc, -EBUSY);
+    CU_ASSERT(g_async_done == false);
+    CU_ASSERT(__atomic_load_n(&vb->rec_in_progress, __ATOMIC_ACQUIRE) == false);
+
+    __atomic_store_n(&vb->write_in_progress, false, __ATOMIC_RELEASE);
     test_cleanup();
 }
 
@@ -678,7 +916,123 @@ test_wal_recovery_rejects_bad_bounds(void)
     CU_ASSERT(g_async_done == true);
     CU_ASSERT_EQUAL(g_async_rc, -EIO);
     CU_ASSERT_EQUAL(g_main_write_count, 0);
+    CU_ASSERT(wal_recovery_required(vb) == true);
 
+    test_cleanup();
+}
+
+static void
+test_wal_destruct_puts_recovery_channels_before_close(void)
+{
+    struct wal_vbdev *vb;
+    int rc;
+
+    test_setup();
+    rc = wal_bdev_create_disk("main", "journal", "wal0", NULL, NULL, test_cb, NULL);
+    CU_ASSERT_EQUAL(rc, 0);
+    poll_threads();
+    vb = TAILQ_FIRST(&g_wal);
+    CU_ASSERT_PTR_NOT_NULL_FATAL(vb);
+
+    rc = wal_bdev_recover("wal0", test_cb, NULL);
+    CU_ASSERT_EQUAL(rc, 0);
+    CU_ASSERT_PTR_NOT_NULL(vb->rec.jch);
+    CU_ASSERT_PTR_NOT_NULL(vb->rec.mch);
+
+    TAILQ_REMOVE(&g_wal, vb, link);
+    g_destruct_vb = vb;
+    wal_destruct(vb);
+    g_destruct_vb = NULL;
+
+    CU_ASSERT(g_close_with_rec_channel == false);
+
+    test_cleanup();
+}
+
+static void
+test_wal_recovery_stops_at_payload_crc_mismatch(void)
+{
+    struct wal_vbdev *vb;
+    struct wal_record_header hdr;
+    char data[512] = "expected payload";
+    char corrupt[512] = "corrupt payload";
+    struct wal_superblock *sb = (struct wal_superblock *)g_journal_data;
+
+    test_setup();
+    wal_bdev_create_disk("main", "journal", "wal0", NULL, NULL, test_cb, NULL);
+    poll_threads();
+    vb = TAILQ_FIRST(&g_wal);
+    CU_ASSERT_PTR_NOT_NULL_FATAL(vb);
+
+    hdr = ut_make_record(10, 500, 1, data);
+    memcpy(&g_journal_data[1 * 512], &hdr, sizeof(hdr));
+    memcpy(&g_journal_data[2 * 512], corrupt, 512);
+
+    g_async_done = false;
+    wal_bdev_recover("wal0", test_cb, NULL);
+    for (int i = 0; i < 10; i++) {
+        wal_recover_poll(vb);
+        poll_threads();
+        if (g_async_done) break;
+    }
+
+    CU_ASSERT(g_async_done == true);
+    CU_ASSERT_EQUAL(g_async_rc, 0);
+    CU_ASSERT_EQUAL(g_main_write_count, 0);
+    CU_ASSERT_EQUAL(vb->sb.checkpoint_seq, 0);
+    CU_ASSERT_EQUAL(vb->sb.head_pos, 1);
+    CU_ASSERT_EQUAL(vb->sb.write_pos, 1);
+    CU_ASSERT(wal_superblock_valid(vb, sb));
+
+    test_cleanup();
+}
+
+static void
+test_wal_required_recovery_rejects_corrupt_payload(void)
+{
+    struct wal_vbdev *vb;
+    struct wal_record_header hdr;
+    char data[512] = "expected payload";
+    char corrupt[512] = "corrupt payload";
+    struct spdk_io_channel *qch;
+    struct spdk_bdev_io *bdev_io;
+    struct iovec iov;
+
+    test_setup();
+    wal_bdev_create_disk("main", "journal", "wal0", NULL, NULL, test_cb, NULL);
+    poll_threads();
+    vb = TAILQ_FIRST(&g_wal);
+    CU_ASSERT_PTR_NOT_NULL_FATAL(vb);
+
+    hdr = ut_make_record(10, 500, 1, data);
+    memcpy(&g_journal_data[1 * 512], &hdr, sizeof(hdr));
+    memcpy(&g_journal_data[2 * 512], corrupt, 512);
+    wal_set_recovery_required(vb);
+
+    g_async_done = false;
+    wal_bdev_recover("wal0", test_cb, NULL);
+    for (int i = 0; i < 10; i++) {
+        wal_recover_poll(vb);
+        poll_threads();
+        if (g_async_done) break;
+    }
+
+    CU_ASSERT(g_async_done == true);
+    CU_ASSERT_EQUAL(g_async_rc, -EIO);
+    CU_ASSERT_EQUAL(g_main_write_count, 0);
+    CU_ASSERT(wal_recovery_required(vb) == true);
+
+    qch = wal_get_io_channel(vb);
+    iov.iov_base = data;
+    iov.iov_len = sizeof(data);
+    g_io_complete_count = 0;
+    bdev_io = ut_alloc_wal_io(vb, SPDK_BDEV_IO_TYPE_WRITE, &iov, 1, 20, 1);
+    wal_submit_request(qch, bdev_io);
+    CU_ASSERT_EQUAL(g_last_io_status, SPDK_BDEV_IO_STATUS_FAILED);
+    CU_ASSERT_EQUAL(g_io_complete_count, 1);
+
+    free(bdev_io);
+    spdk_put_io_channel(qch);
     test_cleanup();
 }
 
@@ -743,8 +1097,16 @@ main(int argc, char *argv[])
     }
 
     if (CU_add_test(suite, "test_wal_init", test_wal_init) == NULL ||
+        CU_add_test(suite, "test_wal_init_rejects_claim_failure",
+                    test_wal_init_rejects_claim_failure) == NULL ||
+        CU_add_test(suite, "test_wal_init_rejects_same_underlying_bdev",
+                    test_wal_init_rejects_same_underlying_bdev) == NULL ||
+        CU_add_test(suite, "test_wal_init_rejects_small_block_size",
+                    test_wal_init_rejects_small_block_size) == NULL ||
         CU_add_test(suite, "test_wal_init_rejects_corrupt_superblock",
                     test_wal_init_rejects_corrupt_superblock) == NULL ||
+        CU_add_test(suite, "test_wal_delete_and_recover_reject_create_in_progress",
+                    test_wal_delete_and_recover_reject_create_in_progress) == NULL ||
         CU_add_test(suite, "test_wal_write", test_wal_write) == NULL ||
         CU_add_test(suite, "test_wal_wrap_around", test_wal_wrap_around) == NULL ||
         CU_add_test(suite, "test_wal_recovery", test_wal_recovery) == NULL ||
@@ -754,10 +1116,20 @@ main(int argc, char *argv[])
                     test_wal_write_immediate_error_releases_lock) == NULL ||
         CU_add_test(suite, "test_wal_checkpoint_not_advanced_on_sb_failure",
                     test_wal_checkpoint_not_advanced_on_sb_failure) == NULL ||
+        CU_add_test(suite, "test_wal_main_failure_requires_recovery_before_new_io",
+                    test_wal_main_failure_requires_recovery_before_new_io) == NULL ||
         CU_add_test(suite, "test_wal_flush_rejected_during_recovery",
                     test_wal_flush_rejected_during_recovery) == NULL ||
+        CU_add_test(suite, "test_wal_recovery_rejects_during_write",
+                    test_wal_recovery_rejects_during_write) == NULL ||
         CU_add_test(suite, "test_wal_recovery_rejects_bad_bounds",
                     test_wal_recovery_rejects_bad_bounds) == NULL ||
+        CU_add_test(suite, "test_wal_destruct_puts_recovery_channels_before_close",
+                    test_wal_destruct_puts_recovery_channels_before_close) == NULL ||
+        CU_add_test(suite, "test_wal_recovery_stops_at_payload_crc_mismatch",
+                    test_wal_recovery_stops_at_payload_crc_mismatch) == NULL ||
+        CU_add_test(suite, "test_wal_required_recovery_rejects_corrupt_payload",
+                    test_wal_required_recovery_rejects_corrupt_payload) == NULL ||
         CU_add_test(suite, "test_wal_recovery_pad_wrap",
                     test_wal_recovery_pad_wrap) == NULL) {
         CU_cleanup_registry();
