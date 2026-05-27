@@ -1,4 +1,31 @@
+# WAL size matrix benchmark
 
+- Дата запуска: 2026-05-24T02:54:50
+- SPDK commit: `8289ba56c45fe278af9b3765a95068dba5af4d17`
+- Workload: write, 4 KiB, qd1
+- Runtime на комбинацию: 5 s
+- Backing device: malloc bdev
+- Обычный bdev: прямой write в `MallocMain`, без WAL и journal bdev.
+- SPDK runtime: `--no-pci --no-huge --iova-mode=va`
+- Размер журнала округлён до ближайшего 4 KiB block.
+- `IOPS bdev` и `throughput bdev` измерены отдельным запуском обычного bdev для того же main size.
+- Ratio-колонки показывают отношение WAL-строки к обычному bdev того же main size.
+
+## Окружение
+
+| Параметр | Значение |
+|---|---|
+| Ноутбук | LENOVO 83D2 / XiaoXinPro 14 IMH9 |
+| CPU | Intel(R) Core(TM) Ultra 5 125H; 18 logical CPUs; 14 cores/socket; 2 threads/core; 1 socket |
+| Диапазон частот CPU | 400 MHz - 4.6 GHz |
+| RAM | 30 GiB total |
+| Kernel | 7.0.9-104.fc43.x86_64 |
+| Hugepages | команды бенчмарка использовали `--no-huge`; текущий `HugePages_Total` равен 0 |
+| Физический NVMe | SKHynix_HFS001TEJ4X112N, 953.9 GiB, 512 B logical/physical sectors; в этой матрице не использовался |
+| Backing для бенчмарка | `MallocMain` и `MallocJournal` malloc bdevs, не физический SSD |
+| SPDK runtime | `--no-pci --no-huge --iova-mode=va`, `--disable-cpumask-locks`, CPU mask `0x1` |
+| SPDK memory | выбирается скриптом для каждой строки; минимум 1024 MiB, максимум 4608 MiB для самой большой WAL-строки |
+| fio | `fio-3.40` в локальной системе |
 
 ## bdevperf
 
