@@ -5,7 +5,6 @@
 #include <spdk/log.h>
 #include "vbdev_wal.h"
 
-/* Структура нашего журналируемого устройства для rpc-запроса */
 struct rpc_bdev_wal_create {
 	char *name;
 	uint32_t block_sz;
@@ -14,7 +13,6 @@ struct rpc_bdev_wal_create {
 	char *main_bdev_name;
 };
 
-/* Парсинг с json полей для функции создания */
 static const struct spdk_json_object_decoder rpc_bdev_wal_create_decoders[] = {
 	{"name",
 	 offsetof(struct rpc_bdev_wal_create, name),
@@ -35,42 +33,51 @@ static const struct spdk_json_object_decoder rpc_bdev_wal_create_decoders[] = {
 	 spdk_json_decode_string},
 };
 
-/* Функция для очистки указателей-полей структуры rpc-запроса */
 static void free_rpc_bdev_wal_create(struct rpc_bdev_wal_create *req) {
 	free(req->name);
 	free(req->journal_bdev_name);
 	free(req->main_bdev_name);
 }
 
-/* Структура для удаления нашего журналируемого устройства */
 struct rpc_bdev_wal_delete {
 	char *name;
 };
 
-/* Функция для очистки указателя-поля структуры для удаления журналируемого устройства */
 static void free_rpc_bdev_wal_delete(struct rpc_bdev_wal_delete *req) {
 	free(req->name);
 }
 
-/* Парсинг с json поля для структуры удаления */
 static const struct spdk_json_object_decoder rpc_bdev_wal_delete_decoders[] = {
 	{"name",
 	 offsetof(struct rpc_bdev_wal_delete, name),
 	 spdk_json_decode_string}};
 
+static void rpc_journaling_bdev_create_cb(void *cb_arg, int rc) {
+	struct spdk_jsonrpc_request *request = cb_arg;
+	struct spdk_json_write_ctx *w;
+
+	if (rc != 0) {
+		spdk_jsonrpc_send_error_response(request,
+						 rc,
+						 spdk_strerror(-rc));
+		return;
+	}
+
+	w = spdk_jsonrpc_begin_result(request);
+	spdk_json_write_string(w, "success");
+	spdk_jsonrpc_end_result(request, w);
+}
+
 static void rpc_journaling_bdev_create(struct spdk_jsonrpc_request *request,
 				       const struct spdk_json_val *params) {
 	struct rpc_bdev_wal_create req = {NULL};
-	struct spdk_json_write_ctx *w;
 	int rc;
 
 	if (spdk_json_decode_object(params,
 				    rpc_bdev_wal_create_decoders,
 				    SPDK_COUNTOF(rpc_bdev_wal_create_decoders),
 				    &req)) {
-		SPDK_DEBUGLOG(
-			wal_vbdev,
-			"spdk_json_decode_object failed\n"); // добавить wal_vbdev
+		SPDK_DEBUGLOG(wal_vbdev, "spdk_json_decode_object failed\n");
 		spdk_jsonrpc_send_error_response(
 			request,
 			SPDK_JSONRPC_ERROR_INTERNAL_ERROR,
@@ -82,7 +89,9 @@ static void rpc_journaling_bdev_create(struct spdk_jsonrpc_request *request,
 				  req.journal_bdev_name,
 				  req.name,
 				  &req.block_sz,
-				  &req.size_mb);
+				  &req.size_mb,
+				  rpc_journaling_bdev_create_cb,
+				  request);
 	if (rc != 0) {
 		spdk_jsonrpc_send_error_response(request,
 						 rc,
@@ -90,19 +99,16 @@ static void rpc_journaling_bdev_create(struct spdk_jsonrpc_request *request,
 		goto cleanup;
 	}
 
-	w = spdk_jsonrpc_begin_result(request);
-	spdk_json_write_string(w, req.name);
-	spdk_jsonrpc_end_result(request, w);
+	free_rpc_bdev_wal_create(&req);
+	return;
 
 cleanup:
 	free_rpc_bdev_wal_create(&req);
 }
-/* Зарегистрировали устройство */
 SPDK_RPC_REGISTER("wal_bdev_create",
 		  rpc_journaling_bdev_create,
 		  SPDK_RPC_RUNTIME)
 
-/* Call-back завершения удаления */
 static void rpc_journaling_bdev_delete_cb(void *cb_arg, int bdeverrno) {
 	struct spdk_jsonrpc_request *request = cb_arg;
 
@@ -115,10 +121,10 @@ static void rpc_journaling_bdev_delete_cb(void *cb_arg, int bdeverrno) {
 	}
 }
 
-/* Удаление нашего устройства */
 static void rpc_wal_bdev_delete(struct spdk_jsonrpc_request *request,
 				const struct spdk_json_val *params) {
 	struct rpc_bdev_wal_delete req = {NULL};
+	int rc;
 
 	if (spdk_json_decode_object(params,
 				    rpc_bdev_wal_delete_decoders,
@@ -131,13 +137,17 @@ static void rpc_wal_bdev_delete(struct spdk_jsonrpc_request *request,
 		goto cleanup;
 	}
 
-	wal_bdev_delete_disk(req.name, rpc_journaling_bdev_delete_cb, request);
+	rc = wal_bdev_delete_disk(req.name, rpc_journaling_bdev_delete_cb, request);
+	if (rc != 0) {
+		spdk_jsonrpc_send_error_response(request,
+						 rc,
+						 spdk_strerror(-rc));
+	}
 
 cleanup:
 	free_rpc_bdev_wal_delete(&req);
 }
 
-/* Удаление зарегистрированного устройства */
 SPDK_RPC_REGISTER("wal_bdev_delete", rpc_wal_bdev_delete, SPDK_RPC_RUNTIME)
 
 struct rpc_wal_bdev_recover {
@@ -163,10 +173,11 @@ static void rpc_wal_bdev_recover_done(void *cb_arg, int bdeverrno) {
 	}
 }
 
-/* Восстановления при сбое записи */
 static void rpc_wal_bdev_recover(struct spdk_jsonrpc_request *request,
 				 const struct spdk_json_val *params) {
-	struct rpc_wal_bdev_recover req = {};
+	struct rpc_wal_bdev_recover req = {NULL};
+	int rc;
+
 	if (spdk_json_decode_object(params,
 				    rpc_wal_bdev_recover_decoders,
 				    SPDK_COUNTOF(rpc_wal_bdev_recover_decoders),
@@ -175,10 +186,10 @@ static void rpc_wal_bdev_recover(struct spdk_jsonrpc_request *request,
 			request,
 			SPDK_JSONRPC_ERROR_INVALID_PARAMS,
 			"invalid params");
-		return;
+		goto cleanup;
 	}
 
-	int rc = wal_bdev_recover(req.name, rpc_wal_bdev_recover_done, request);
+	rc = wal_bdev_recover(req.name, rpc_wal_bdev_recover_done, request);
 	if (rc != 0) {
 		spdk_jsonrpc_send_error_response_fmt(
 			request,
@@ -186,6 +197,8 @@ static void rpc_wal_bdev_recover(struct spdk_jsonrpc_request *request,
 			"wal_bdev_recover start failed: %d",
 			rc);
 	}
+
+cleanup:
 	free(req.name);
 }
 
