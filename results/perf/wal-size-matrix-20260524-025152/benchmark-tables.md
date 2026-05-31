@@ -1,6 +1,5 @@
 # WAL size matrix benchmark
 
-- Дата запуска: 2026-06-01T00:59:25
 - SPDK commit: `8289ba56c45fe278af9b3765a95068dba5af4d17`
 - Workload: write, 4 KiB, qd1
 - Runtime на комбинацию: 10 повторов по 5 s
